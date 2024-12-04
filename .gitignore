@@ -1,0 +1,7 @@
+requirements.txt
+results/
+predicitions/
+visualizations/
+data/*
+.env
+venv
