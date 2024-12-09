@@ -1,13 +1,15 @@
-
 input_features:
   - name: text
     type: text  # We assume the data consists of text for language classification
+    preprocessing:
+      tokenizer: ngram
+      ngram: 3
+      max_sequence_length: 256
     encoder:
-      type: bert
-      pretrained_model_name_or_path: bert-base-multilingual-uncased
+      type: parallel_cnn
 
 output_features:
-  - name: intent
+  - name: language
     type: category  # Multi-class classification problem, with language labels
     decoder:
       type: classifier
