@@ -5,7 +5,7 @@ services:
     image: ludwigai/ludwig:master
     command: >
       predict
-      --model_path /src/results/experiment_run_0/model
+      --model_path /src/results/experiment_run/model
       --dataset /data/predict.csv
       --output_directory /src/predictions
     volumes:
