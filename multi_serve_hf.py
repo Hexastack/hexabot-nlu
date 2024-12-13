@@ -1,11 +1,12 @@
 import argparse
+import asyncio
 import io
 import json
 import logging
 import os
 import sys
 import tempfile
-from typing import Optional, Tuple, Union, List
+from typing import Dict, Optional, Tuple, Union, List
 
 import pandas as pd
 import torch
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import uvicorn
-    from fastapi import FastAPI
+    from fastapi import FastAPI, status
     from starlette.datastructures import UploadFile
     from starlette.middleware import Middleware
     from starlette.middleware.cors import CORSMiddleware
@@ -109,25 +110,29 @@ def download_model_from_huggingface(
         os.makedirs(repo_dir, exist_ok=True)
         
         # Download the model from Hugging Face
-        snapshot_download(
-            repo_id=repo_id,
-            force_download=force_download,
-            local_dir=repo_dir,
-            repo_type="model"
-        )
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                force_download=force_download,
+                local_dir=repo_dir,
+                repo_type="model"
+            )
+        except Exception as e:
+            logging.warning(f"Failed to download the model from hugging_face: {e}")
+
 
 def load_model(
     save_dir: str,
     repo_dir: str,
     repo_id: str,
     logging_level: int = logging.ERROR,
-    backend: Optional[Union[Backend, str]] = None,
+    backend: Optional[Union[str, object]] = None,
     gpus: Optional[Union[str, int, List[int]]] = None,
     gpu_memory_limit: Optional[float] = None,
     allow_parallel_threads: bool = True,
-    callbacks: List[Callback] = None,
+    callbacks: List[object] = None,
     from_checkpoint: bool = False,
-) -> LudwigModel:
+) -> Optional[LudwigModel]:
     """
     Load a pretrained model from the specified directory, or download it from Hugging Face if necessary.
     
@@ -149,25 +154,28 @@ def load_model(
     - from_checkpoint: If True, loads from the checkpoint rather than the final weights.
 
     Returns:
-    - LudwigModel: A LudwigModel instance with restored weights and metadata.
+    - Optional[LudwigModel]: A LudwigModel instance with restored weights and metadata, or `None` if an error occurred.
     """
-    # Step 1: Check if the model checkpoint exists locally, and if not, download it
-    if not os.path.isfile(os.path.join(save_dir, "checkpoint")):
-        download_model_from_huggingface(repo_id, repo_dir)
+    try:
+        # Step 1: Check if the model checkpoint exists locally, and if not, download it
+        if not os.path.isfile(os.path.join(save_dir, "checkpoint")):
+            download_model_from_huggingface(repo_id, repo_dir)
 
-    # Step 2: Load the model using LudwigModel.load()
-    ludwig_model = LudwigModel.load(
-        model_dir=save_dir,
-        logging_level=logging_level,
-        backend=backend,
-        gpus=gpus,
-        gpu_memory_limit=gpu_memory_limit,
-        allow_parallel_threads=allow_parallel_threads,
-        callbacks=callbacks,
-        from_checkpoint=from_checkpoint
-    )
-
-    return ludwig_model
+        # Step 2: Load the model using LudwigModel.load()
+        ludwig_model = LudwigModel.load(
+            model_dir=save_dir,
+            logging_level=logging_level,
+            backend=backend,
+            gpus=gpus,
+            gpu_memory_limit=gpu_memory_limit,
+            allow_parallel_threads=allow_parallel_threads,
+            callbacks=callbacks,
+            from_checkpoint=from_checkpoint
+        )
+        return ludwig_model
+    except Exception as e:
+        logging.warning(f"Failed to load the model: {e}")
+        return None
 
 def server(models, allowed_origins=None):
     middleware = [Middleware(CORSMiddleware, allow_origins=allowed_origins)] if allowed_origins else None
@@ -176,41 +184,72 @@ def server(models, allowed_origins=None):
     @app.get("/")
     def check_health():
         return NumpyJSONResponse({"message": "Ludwig server is up", "models": list(models.keys())})
-
+        
+    
     @app.post("/predict")
     async def predict(request: Request):
         try:
+            # Parse form data
             form = await request.form()
-            model_name = form.get("model_name")
-            if model_name not in models:
-                return NumpyJSONResponse(
-                    {"error": f"Model '{model_name}' not found. Available models: {list(models.keys())}."},
-                    status_code=400,
-                )
-            model = models[model_name]
-            input_features = {f[COLUMN] for f in model.config["input_features"]}
-            entry, files = convert_input(form, model.model.input_features)
+            model_names = form.get("model")  # Single model or list of models
+            model_names = model_names.split(",") if model_names else None
+            entry, files = convert_input(form, None)  # Input compatible with all models
         except Exception:
             logger.exception("Failed to parse predict form")
             return NumpyJSONResponse(COULD_NOT_RUN_INFERENCE_ERROR, status_code=500)
 
-        try:
-            if (entry.keys() & input_features) != input_features:
-                missing_features = set(input_features) - set(entry.keys())
-                return NumpyJSONResponse(
-                    {
-                        "error": "Data received does not contain all input features. "
-                        f"Missing features: {missing_features}."
-                    },
-                    status_code=400,
-                )
+        async def predict_by_model(model_name: str, model: LudwigModel) -> dict:
             try:
+                input_features = {f[COLUMN] for f in model.config["input_features"]}
+                if (entry.keys() & input_features) != input_features:
+                    missing_features = set(input_features) - set(entry.keys())
+                    return {
+                        "model": model_name,
+                        "response": {
+                            "error": f"Missing features: {missing_features}.",
+                            "status": "failed",
+                        },
+                    }
                 resp, _ = model.predict(dataset=[entry], data_format=dict)
-                resp = resp.to_dict("records")[0]
-                return NumpyJSONResponse(resp)
+                return {
+                    "model": model_name,
+                    "response": {
+                        "predictions": resp.to_dict("records")[0],
+                        "status": "success",
+                    },
+                }
             except Exception as exc:
-                logger.exception(f"Failed to run predict: {exc}")
-                return NumpyJSONResponse(COULD_NOT_RUN_INFERENCE_ERROR, status_code=500)
+                logger.exception(f"Failed to predict for model '{model_name}': {exc}")
+                return {
+                    "model": model_name,
+                    "response": {
+                        "error": str(exc),
+                        "status": "failed",
+                    },
+                }
+
+        try:
+            # Determine target models
+            if model_names:
+                invalid_models = [name for name in model_names if name not in models]
+                if invalid_models:
+                    return NumpyJSONResponse(
+                        {"error": f"Invalid model names: {invalid_models}. Available models: {list(models.keys())}."},
+                        status_code=400,
+                    )
+                target_models = {name: models[name] for name in model_names}
+            else:  
+                # Predict for all models if no specific model(s) are provided
+                target_models = models
+
+            # Run 
+            tasks = [predict_by_model(name, model) for name, model in target_models.items()]
+            results = await asyncio.gather(*tasks)
+            responses = {result["model"]: result["response"] for result in results}
+            return NumpyJSONResponse(responses)
+        except Exception:
+            logger.exception("Failed to execute predictions")
+            return NumpyJSONResponse(COULD_NOT_RUN_INFERENCE_ERROR, status_code=500)
         finally:
             for f in files:
                 os.remove(f.name)
@@ -218,38 +257,73 @@ def server(models, allowed_origins=None):
     @app.post("/batch_predict")
     async def batch_predict(request: Request):
         try:
+            # Parse form data
             form = await request.form()
-            model_name = form.get("model_name")
-            if model_name not in models:
-                return NumpyJSONResponse(
-                    {"error": f"Model '{model_name}' not found. Available models: {list(models.keys())}."},
-                    status_code=400,
-                )
-            model = models[model_name]
-            input_features = {f[COLUMN] for f in model.config["input_features"]}
-            data, files = convert_batch_input(form, model.model.input_features)
-            data_df = pd.DataFrame.from_records(data["data"], index=data.get("index"), columns=data["columns"])
+            model_names = form.get("model")  # Single model or list of models
+            model_names = model_names.split(",") if model_names else None
+            files=[]
+           
         except Exception:
             logger.exception("Failed to parse batch_predict form")
             return NumpyJSONResponse(COULD_NOT_RUN_INFERENCE_ERROR, status_code=500)
 
-        if (set(data_df.columns) & input_features) != input_features:
-            missing_features = set(input_features) - set(data_df.columns)
-            return NumpyJSONResponse(
-                {
-                    "error": "Data received does not contain all input features. "
-                    f"Missing features: {missing_features}."
-                },
-                status_code=400,
-            )
-        try:
-            resp, _ = model.predict(dataset=data_df)
-            resp = resp.to_dict("split")
-            return NumpyJSONResponse(resp)
-        except Exception:
-            logger.exception("Failed to run batch_predict: {}")
-            return NumpyJSONResponse(COULD_NOT_RUN_INFERENCE_ERROR, status_code=500)
+        async def batch_predict_by_model(model_name:str , model: LudwigModel) -> dict:
+            try:
+                data, files = convert_batch_input(form, model.model.input_features) 
+                data_df = pd.DataFrame.from_records(data["data"], index=data.get("index"), columns=data["columns"])
+                input_features = {f[COLUMN] for f in model.config["input_features"]}
 
+                if (set(data_df.columns) & input_features) != input_features:
+                    missing_features = set(input_features) - set(data_df.columns)
+                    return {
+                        "model": model_name,
+                        "response": {
+                            "error": f"Missing features: {missing_features}.",
+                            "status": "failed",
+                        },
+                    }
+                resp, _ = model.predict(dataset=data_df)
+                return {
+                    "model": model_name,
+                    "response": {
+                        "predictions": resp.to_dict("split"),
+                        "status": "success",
+                    },
+                }
+            except Exception as exc:
+                logger.exception(f"Failed to batch predict for model '{model_name}': {exc}")
+                return {
+                    "model": model_name,
+                    "response": {
+                        "error": str(exc),
+                        "status": "failed",
+                    },
+                }
+
+        try:
+            # Determine target models
+            if model_names:
+                invalid_models = [name for name in model_names if name not in models]
+                if invalid_models:
+                    return NumpyJSONResponse(
+                        {"error": f"Invalid model names: {invalid_models}. Available models: {list(models.keys())}."},
+                        status_code=400,
+                    )
+                target_models = {name: models[name] for name in model_names}
+            else:  # Predict for all models if no specific model(s) are provided
+                target_models = models
+
+            # Run batch predictions
+            tasks = [batch_predict_by_model(name, model) for name, model in target_models.items()]
+            results = await asyncio.gather(*tasks)
+            responses = {result["model"]: result["response"] for result in results}
+            return NumpyJSONResponse(responses)
+        except Exception:
+            logger.exception("Failed to execute batch predictions")
+            return NumpyJSONResponse(COULD_NOT_RUN_INFERENCE_ERROR, status_code=500)
+        finally:
+            for f in files:
+                os.remove(f.name)
     return app
 
 def _write_file(v, files):
@@ -306,6 +380,11 @@ def convert_batch_input(form, input_features):
                     row[i] = _read_image_buffer(file_index[value])
 
     return data, files
+
+async def are_models_loaded(models: Dict[str, LudwigModel]) -> bool:
+    # Implement a check to verify all models are fully loaded
+    return all(model is not None for model in models.values())
+
 def run_server(
     model_paths: dict,  # Dictionary of model IDs to paths
     host: str,
@@ -316,11 +395,22 @@ def run_server(
     # If model_paths is a string, convert it to a dictionary
     if isinstance(model_paths, str):
         model_paths = json.loads(model_paths)
-
+    
     models = {}
     for model_name, repo_id in model_paths.items():
         repo_id, repo_dir, save_dir = process_repo_name(repo_id, "model")
         models[model_name] = load_model(save_dir, repo_dir, repo_id=repo_id, backend="local")
+    
+
+    # Check if models are loaded
+    if not asyncio.run(are_models_loaded(models)):
+        headers = {"Retry-After": "120"}  # Suggest retrying after 2 minutes
+        response = NumpyJSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"message": "Models are still loading, please retry later."},
+            headers=headers,
+        )
+        return response
 
     app = server(models, allowed_origins)
     uvicorn.run(app, host=host, port=port)
@@ -328,7 +418,7 @@ def run_server(
 
 def cli(sys_argv):
     parser = argparse.ArgumentParser(
-        description="This script serves a pretrained model", prog="ludwig serve", usage="%(prog)s [options]"
+        description="This script serves multiple pretrained models", prog="ludwig multi_serve_hf", usage="%(prog)s [options]"
     )
 
     # ----------------

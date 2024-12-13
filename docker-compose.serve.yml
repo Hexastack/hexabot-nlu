@@ -4,18 +4,19 @@ services:
   ludwig:
     image: ludwigai/ludwig:master
     command: >-
-      serve
-      --model_paths '${MODEL_PATHS}'
+      multi_serve_hf
+      --model_paths '${MODEL_PATHS}' --port ${PORT} --host ${HOST}
     stdin_open: true
     tty: true
     env_file: .env
     volumes:
       - ./data:/data 
       - ./results:/results
-      - ./serve.py:/usr/local/lib/python3.8/site-packages/ludwig/serve.py
+      - ./cli.py:/usr/local/lib/python3.8/site-packages/ludwig/cli.py
+      - ./multi_serve_hf.py:/usr/local/lib/python3.8/site-packages/ludwig/multi_serve_hf.py
       - nlu-data:/app/repos
 
     ports:
-      - "8000:8000" 
+      - "${PORT}:${PORT}" 
 volumes:
   nlu-data:
